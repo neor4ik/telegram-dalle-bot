@@ -170,7 +170,7 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-    main() No
+    main() 
 
 if __name__ == "__main__":
     main()
