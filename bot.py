@@ -1,211 +1,180 @@
-import logging
 import os
-import sqlite3
-import openai
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-)
+import logging
+import tempfile
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
+from moviepy.editor import ImageClip, AudioFileClip
+import asyncio
 
-# Логи
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 
-# Конфигурация токенов и ключей из переменных окружения
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_API_KEY
 
-# Настройки тарифов
-TARIFFS = {
-    "free": {"name": "Бесплатный", "tokens": 10, "price": "0 ₽"},
-    "basic": {"name": "Базовый", "tokens": 50, "price": "120 ₽"},
-    "optimal": {"name": "Оптимальный", "tokens": 150, "price": "400 ₽"},
-    "premium": {"name": "Премиум", "tokens": 400, "price": "1000 ₽"},
-}
+# Состояния пользователей
+user_states = {}
 
-TOKEN_COST = 3  # токенов за генерацию
+WAITING_FOR_PHOTO = "waiting_for_photo"
+WAITING_FOR_AUDIO = "waiting_for_audio"
 
-# Инициализация базы SQLite
-conn = sqlite3.connect("users.db", check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute(
-    """
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    tokens INTEGER DEFAULT 0
-)
-"""
-)
-conn.commit()
-
-
-def get_tokens(user_id: int) -> int:
-    cursor.execute("SELECT tokens FROM users WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    return row[0] if row else 0
-
-
-def set_tokens(user_id: int, tokens: int):
-    if get_tokens(user_id) == 0:
-        cursor.execute(
-            "INSERT OR IGNORE INTO users(user_id, tokens) VALUES (?, ?)", (user_id, tokens)
-        )
-    else:
-        cursor.execute("UPDATE users SET tokens = ? WHERE user_id = ?", (tokens, user_id))
-    conn.commit()
-
-
-def add_tokens(user_id: int, amount: int):
-    current = get_tokens(user_id)
-    set_tokens(user_id, current + amount)
-
-
-# Клавиатура быстрых команд с иконками
+# Клавиатура
 quick_commands_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton("🎨 Сгенерировать"), KeyboardButton("💰 Баланс")],
-        [KeyboardButton("🛒 Купить"), KeyboardButton("📃 Тарифы")],
+        [KeyboardButton("🎬 Создать видео")],
+        [KeyboardButton("🔁 Отменить")],
     ],
     resize_keyboard=True,
     one_time_keyboard=False,
 )
 
-
-# Команды
-
+# Команда /start или "🎬 Создать видео"
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton(f"{v['name']} — {v['price']}", callback_data=f"tariff_{k}")]
-        for k, v in TARIFFS.items()
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    user_id = update.effective_user.id
+    user_states[user_id] = {
+        "state": WAITING_FOR_PHOTO,
+        "photo_path": None,
+        "audio_paths": []
+    }
     await update.message.reply_text(
-        "Добро пожаловать! Выберите тариф для получения токенов:", reply_markup=reply_markup
+        "📸 Пришли фото, которое будет использоваться как фон для видео.",
+        reply_markup=quick_commands_keyboard
     )
-    # Отправляем меню быстрых команд сразу после приветствия
+
+# Фото
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = user_states.get(user_id)
+
+    if not state or state["state"] != WAITING_FOR_PHOTO:
+        await update.message.reply_text("Сначала нажми '🎬 Создать видео'")
+        return
+
+    photo_file = await update.message.photo[-1].get_file()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tf:
+        await photo_file.download_to_drive(custom_path=tf.name)
+        state["photo_path"] = tf.name
+
+    state["state"] = WAITING_FOR_AUDIO
     await update.message.reply_text(
-        "Используйте меню ниже для быстрого доступа к командам.",
-        reply_markup=quick_commands_keyboard,
+        "🎵 Фото получено! Теперь отправь один или несколько аудиофайлов. Когда всё будет готово, напиши /done."
     )
 
+# Аудио
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = user_states.get(user_id)
 
-async def tariff_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    selected = query.data.split("_")[1]
-    tariff = TARIFFS.get(selected)
-    if not tariff:
-        await query.edit_message_text("Неизвестный тариф.")
+    if not state or state["state"] != WAITING_FOR_AUDIO:
+        await update.message.reply_text("Сначала отправь фото.")
         return
 
-    user_id = query.from_user.id
-    add_tokens(user_id, tariff["tokens"])
-
-    await query.edit_message_text(
-        f"Вы выбрали тариф: {tariff['name']}\n"
-        f"Вам начислено {tariff['tokens']} токенов.\n"
-        f"Цена: {tariff['price']}\n\n"
-        f"Стоимость одной генерации: {TOKEN_COST} токенов.\n"
-        f"Используйте меню ниже для быстрого доступа к командам.",
-        reply_markup=quick_commands_keyboard,
-    )
-
-
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    tokens = get_tokens(user_id)
-    await update.message.reply_text(f"У вас {tokens} токенов.", reply_markup=quick_commands_keyboard)
-
-
-async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    tokens = get_tokens(user_id)
-    if tokens < TOKEN_COST:
-        await update.message.reply_text(
-            f"Недостаточно токенов для генерации.\n"
-            f"Купите тариф командой /start",
-            reply_markup=quick_commands_keyboard,
-        )
+    audio = update.message.audio or update.message.voice
+    if not audio:
+        await update.message.reply_text("Пожалуйста, отправь аудио (mp3/voice).")
         return
 
-    prompt = update.message.text
-    if prompt == "🎨 Сгенерировать":
-        await update.message.reply_text("Пожалуйста, отправьте описание для генерации изображения.")
+    audio_file = await audio.get_file()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tf:
+        await audio_file.download_to_drive(custom_path=tf.name)
+        state["audio_paths"].append(tf.name)
+
+    await update.message.reply_text("✅ Аудио принято. Можешь отправить ещё или /done для генерации.")
+
+# /done — генерация
+async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = user_states.get(user_id)
+
+    if not state or state["state"] != WAITING_FOR_AUDIO:
+        await update.message.reply_text("Нет активной сессии. Нажми «🎬 Создать видео».")
         return
 
-    # Если текст — это описание, то генерируем
-    if prompt.strip() == "" or prompt in ["💰 Баланс", "🛒 Купить", "📃 Тарифы"]:
-        # Игнорируем если это команда меню
+    if not state["photo_path"] or not state["audio_paths"]:
+        await update.message.reply_text("Недостаточно данных. Нужно фото и хотя бы один аудиофайл.")
         return
 
-    set_tokens(user_id, tokens - TOKEN_COST)
+    await update.message.reply_text("🎥 Генерирую видео...")
 
-    await update.message.reply_text("Генерирую изображение, подожди немного... 🎨")
-
+    videos = []
     try:
-        response = openai.Image.create(
-            prompt=prompt,
-            n=1,
-            size="512x512",
-        )
-        image_url = response["data"][0]["url"]
-        await update.message.reply_photo(photo=image_url, caption="Готово ✅", reply_markup=quick_commands_keyboard)
+        for i, audio_path in enumerate(state["audio_paths"], start=1):
+            video_path = await asyncio.to_thread(
+                generate_video,
+                state["photo_path"],
+                audio_path,
+                f"video_{user_id}_{i}.mp4"
+            )
+            videos.append(video_path)
+
+        for video_file in videos:
+            with open(video_file, "rb") as f:
+                await update.message.reply_video(video=f)
     except Exception as e:
-        logging.error(f"Ошибка OpenAI: {e}")
-        await update.message.reply_text("❌ Произошла ошибка при генерации изображения.", reply_markup=quick_commands_keyboard)
+        logging.error(f"Ошибка генерации видео: {e}")
+        await update.message.reply_text("❌ Ошибка при генерации видео.")
+    finally:
+        cleanup_files([state["photo_path"]] + state["audio_paths"] + videos)
+        user_states.pop(user_id,
+OLXTOTO: Link Alternatif Login Togel Online & Taruhan angka Terpercaya
+OLXTOTO: Link Alternatif Login Togel Online & Taruhan angka Terpercaya
+furyevents.co.uk
 
 
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Покупка токенов пока не реализована.\nСкоро добавим оплату через ЮMoney.", reply_markup=quick_commands_keyboard
-    )
+ne)
 
+# Отмена
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_states.pop(user_id, None)
+    await update.message.reply_text("❌ Сессия отменена.", reply_markup=quick_commands_keyboard)
 
-# Обработка меню быстрых сообщений
-async def quick_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Быстрые кнопки
+async def handle_quick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    if text == "🎨 Сгенерировать":
-        await update.message.reply_text("Пришлите описание для генерации изображения.")
-    elif text == "💰 Баланс":
-        await balance(update, context)
-    elif text == "🛒 Купить":
-        await buy(update, context)
-    elif text == "📃 Тарифы":
+    if text == "🎬 Создать видео":
         await start(update, context)
+    elif text == "🔁 Отменить":
+        await cancel(update, context)
 
+# Генерация видео
+def generate_video(photo_path, audio_path, output_path):
+    audio_clip = AudioFileClip(audio_path)
+    image_clip = ImageClip(photo_path).set_duration(audio_clip.duration).set_audio(audio_clip)
+    image_clip.write_videofile(output_path, fps=24, codec="libx264", audio_codec="aac", verbose=False, logger=None)
+    return output_path
 
+# Очистка
+def cleanup_files(files):
+    for f in files:
+        try:
+            os.remove(f)
+        except Exception:
+            pass
+
+# main
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(tariff_button, pattern=r"^tariff_"))
-    app.add_handler(CommandHandler("balance", balance))
-    app.add_handler(CommandHandler("buy", buy))
+    app.add_handler(CommandHandler("done", done))
+    app.add_handler(CommandHandler("cancel", cancel))
 
-    from telegram.ext import MessageHandler
-
-    # Обработка сообщений из меню быстрых сообщений
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), quick_command_handler))
-
-    # Обработка текстовых сообщений для генерации после команды "🎨 Сгенерировать"
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), generate))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_quick_command))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio))
 
     print("Бот запущен...")
     app.run_polling()
 
+if __name__ == "__main__":
+    main() No
 
 if __name__ == "__main__":
     main()
